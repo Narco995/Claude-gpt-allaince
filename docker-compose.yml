@@ -1,0 +1,6 @@
+services:
+  bridge:
+    build: .
+    ports: ["8787:8787"]
+    env_file: .env          # must set BRIDGE_API_KEY (NODE_ENV=production enforces it)
+    restart: unless-stopped
