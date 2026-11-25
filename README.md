@@ -1,5 +1,7 @@
 # Claude ↔ GPT Universal AI Bridge
 
+[![CI](https://github.com/Narco995/Claude-gpt-allaince/actions/workflows/ci.yml/badge.svg)](https://github.com/Narco995/Claude-gpt-allaince/actions/workflows/ci.yml)
+
 A standalone, provider-agnostic AI-to-AI orchestration bridge. **MCP is the primary interface** (stdio + streamable HTTP) with a thin REST API on top of the same service.
 
 Mandatory workflow, fully implemented and integration-tested:
