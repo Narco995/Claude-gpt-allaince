@@ -4,7 +4,11 @@ import { withTimeout } from "./resilience.js";
 import type { ToolSpec } from "./models.js";
 import type { Logger } from "./logger.js";
 
-export interface ToolContext { signal: AbortSignal; sessionId?: string; callerId?: string; logger: Logger }
+export interface ToolPrincipal { id: string; scopes: string[] }
+export interface ToolAuthorizer {
+  can(principal: ToolPrincipal, action: "tool:call", resource?: { type: string; id?: string; tags?: string[] }): boolean;
+}
+export interface ToolContext { signal: AbortSignal; sessionId?: string; callerId?: string; logger: Logger; principal?: ToolPrincipal; authorizer?: ToolAuthorizer }
 
 export interface ToolDefinition<I = unknown> {
   name: string;
@@ -41,6 +45,9 @@ export class ToolRegistry {
   }
   async call(name: string, args: unknown, ctx: ToolContext): Promise<unknown> {
     const tool = this.mustGet(name);
+    if (ctx.principal && ctx.authorizer && !ctx.authorizer.can(ctx.principal, "tool:call", { type: "tool", id: tool.name, tags: tool.tags ?? [] })) {
+      throw new BridgeError("forbidden", `Principal "${ctx.principal.id}" is not authorized to call tool "${tool.name}"`);
+    }
     const parsed = (tool.inputSchema as ZodType).safeParse(args ?? {});
     if (!parsed.success)
       throw new BridgeError("validation", `Invalid arguments for tool "${name}": ${parsed.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`).join("; ")}`);

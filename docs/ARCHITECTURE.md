@@ -41,7 +41,7 @@ created → delegating → critiquing ──────────→ revising
 ```
 1. **Directive** – Claude (the MCP caller, `director`) sends a detailed directive → recorded as `claude>gpt:directive`.
 2. **Delegation** – worker (`gpt`) runs through `runAgent` (optionally with bridge tools) → `result`.
-3. **Critique** – either the critic model (`critiqueMode: "adapter"`, default Claude, JSON-schema validated, one repair retry, graceful fallback) or the caller itself (`critiqueMode: "external"` pauses in `awaiting_critique`; resume via `bridge_submit_critique`).
+3. **Critique** – either the critic model (`critiqueMode: "auto"` (legacy alias `adapter`), default Claude, JSON-schema validated, one repair retry, graceful fallback) or the caller itself (`critiqueMode: "manual"` (legacy alias `external`) pauses in `awaiting_critique`; resume via `bridge_submit_critique`).
 4. **Revision** – worker receives the full thread (directive → its draft → critique) → `revision`. Repeat for `revisionRounds`.
 
 Illegal transitions throw; every transition is logged and emitted to listeners (`engine.onEvent`) for dashboards.
@@ -53,9 +53,13 @@ Illegal transitions throw; every transition is logged and emitted to listeners (
 * Failures end in `failed` with `{code, message}` and an `error` message in the session transcript.
 
 ## Security
-* Bearer-token auth (constant-time) on `/mcp` and `/api/*`; `BRIDGE_API_KEY` is mandatory when `NODE_ENV=production`.
+* Constant-time bearer-token authentication on `/mcp` and `/api/*`; multi-principal identities can be supplied through `BRIDGE_AUTH_TOKENS_JSON`. Production requires `BRIDGE_API_KEY` or a configured token set. `ScopeAuthorizer` enforces action scopes at the REST/MCP service boundary.
+* Per-principal resource ownership prevents cross-user session/workflow reads, writes, critique and cancellation. `admin` scope is required for cross-owner access.
+* Model workers receive separate `agent:<model>` identities and cannot inherit human scopes; risky tool tags require `tool:call:write` or a tool-specific scope.
 * Origin allow-list (`ALLOWED_ORIGINS`) against DNS-rebinding/CSRF; stateless MCP transport; 2 MB body limit.
-* Secrets only via env; structured logs redact `*key*, *token*, authorization, secret, password`.
+* Secrets only via environment; structured logs redact `*key*, *token*, authorization, secret, password`.
+* Workflow creation supports per-principal idempotency keys and a configurable active-run limit (`MAX_CONCURRENT_WORKFLOWS`). Manual critique/cancel control operations are serialized per workflow to prevent concurrent state races.
+* Sessions and workflow checkpoints use atomic JSON snapshots in `BRIDGE_STATE_DIR`; mount durable storage and run one replica. In-flight workflow snapshots are marked `failed/interrupted` after restart; paused manual-review workflows remain resumable.
 * The calculator is a hand-written parser (no `eval`).
 
 ## Extending

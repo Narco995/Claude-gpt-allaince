@@ -1,10 +1,13 @@
 import { AnthropicAdapter } from "./adapters/anthropic.js";
 import { OpenAIAdapter } from "./adapters/openai.js";
-import { AllowAllAuth, StaticTokenAuth } from "./auth.js";
+import { AllowAllAuth, TokenSetAuth } from "./auth.js";
 import type { Config } from "./config.js";
 import { createLogger, type Logger } from "./core/logger.js";
 import { AdapterRegistry, ResilientAdapter, type ModelAdapter } from "./core/models.js";
 import { InMemorySessionStore, type SessionStore } from "./core/session.js";
+import { FileSessionStore, FileWorkflowRunStore, type WorkflowRunStore } from "./core/persistence.js";
+import { join } from "node:path";
+import { ScopeAuthorizer, type Authorizer } from "./extensions/index.js";
 import { ToolRegistry } from "./core/tools.js";
 import { WorkflowEngine } from "./core/workflow.js";
 import type { AuthProvider, BridgePlugin } from "./extensions/index.js";
@@ -12,7 +15,7 @@ import { createApp } from "./interfaces/rest.js";
 import { BridgeService } from "./service.js";
 import { registerBuiltinTools } from "./tools/builtin.js";
 
-export interface BridgeOverrides { adapters?: ModelAdapter[]; sessions?: SessionStore; auth?: AuthProvider; plugins?: BridgePlugin[]; logger?: Logger }
+export interface BridgeOverrides { adapters?: ModelAdapter[]; sessions?: SessionStore; workflowRuns?: WorkflowRunStore; auth?: AuthProvider; authorizer?: Authorizer; plugins?: BridgePlugin[]; logger?: Logger }
 
 /** Composition root. Everything is injectable so tests and future deployments swap parts without touching the core. */
 export function createBridge(config: Config, ov: BridgeOverrides = {}) {
@@ -35,11 +38,15 @@ export function createBridge(config: Config, ov: BridgeOverrides = {}) {
     for (const t of p.tools ?? []) tools.register(t);
     for (const a of p.adapters ?? []) adapters.register(wrap(a));
   }
-  const sessions = ov.sessions ?? new InMemorySessionStore(config.sessions.ttlMs, config.sessions.max);
-  const engine = new WorkflowEngine(adapters, tools, sessions, logger, { maxToolRounds: config.resilience.maxToolRounds, workflowTimeoutMs: config.resilience.workflowTimeoutMs });
-  const service = new BridgeService({ config, adapters, tools, sessions, engine, logger });
-  const auth = ov.auth ?? (config.apiKey ? new StaticTokenAuth(config.apiKey) : new AllowAllAuth());
-  if (!config.apiKey) logger.warn("BRIDGE_API_KEY not set: HTTP interfaces are UNAUTHENTICATED (development only)");
+  const stateDir = config.persistence.directory;
+  const sessions = ov.sessions ?? (stateDir ? new FileSessionStore(join(stateDir, "sessions.json"), config.sessions.ttlMs, config.sessions.max) : new InMemorySessionStore(config.sessions.ttlMs, config.sessions.max));
+  const workflowRuns = ov.workflowRuns ?? (stateDir ? new FileWorkflowRunStore(join(stateDir, "workflows.json")) : undefined);
+  const authorizer = ov.authorizer ?? new ScopeAuthorizer();
+  const engine = new WorkflowEngine(adapters, tools, sessions, logger, { maxToolRounds: config.resilience.maxToolRounds, workflowTimeoutMs: config.resilience.workflowTimeoutMs, maxConcurrentRuns: config.resilience.maxConcurrentRuns }, workflowRuns, authorizer);
+  const service = new BridgeService({ config, adapters, tools, sessions, engine, logger, authorizer });
+  const configuredTokens = [...config.auth.tokens, ...(config.apiKey ? [{ id: config.auth.principalId, token: config.apiKey, scopes: config.auth.scopes }] : [])];
+  const auth = ov.auth ?? (configuredTokens.length ? new TokenSetAuth(configuredTokens) : new AllowAllAuth());
+  if (!config.apiKey && !config.auth.tokens.length) logger.warn("No bridge token configured: HTTP interfaces are UNAUTHENTICATED (development only)");
   const app = createApp(service, auth, { allowedOrigins: config.allowedOrigins, logger });
   return { app, service, adapters, tools, sessions, engine, logger };
 }

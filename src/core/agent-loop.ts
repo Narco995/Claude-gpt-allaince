@@ -1,7 +1,7 @@
 import { BridgeError } from "./errors.js";
 import type { Logger } from "./logger.js";
 import type { AdapterRegistry, ChatMessage, ModelResponse } from "./models.js";
-import type { ToolRegistry } from "./tools.js";
+import type { ToolAuthorizer, ToolPrincipal, ToolRegistry } from "./tools.js";
 import type { MessageType } from "./protocol.js";
 
 export interface AgentRunOptions {
@@ -11,6 +11,7 @@ export interface AgentRunOptions {
   model?: string; temperature?: number; maxTokens?: number; json?: boolean;
   signal: AbortSignal; sessionId?: string; logger: Logger;
   record?: (type: MessageType, content: string, structured?: Record<string, unknown>) => Promise<void>;
+  principal?: ToolPrincipal; authorizer?: ToolAuthorizer;
 }
 export interface AgentRunResult { content: string; toolRounds: number; usage: { inputTokens: number; outputTokens: number }; model: string; transcript: ChatMessage[] }
 
@@ -37,7 +38,7 @@ export async function runAgent(o: AgentRunOptions): Promise<AgentRunResult> {
       await o.record?.("tool_call", `${call.name}(${JSON.stringify(call.arguments)})`, { tool: call.name, arguments: call.arguments, callId: call.id });
       let payload: unknown; let isError = false;
       try {
-        payload = await o.tools.call(call.name, call.arguments, { signal: o.signal, sessionId: o.sessionId, callerId: o.adapterId, logger: o.logger });
+        payload = await o.tools.call(call.name, call.arguments, { signal: o.signal, sessionId: o.sessionId, callerId: o.adapterId, logger: o.logger, principal: o.principal, authorizer: o.authorizer });
       } catch (e) {
         if (e instanceof BridgeError && (e.code === "cancelled")) throw e;
         isError = true; payload = { error: e instanceof Error ? e.message : String(e) };

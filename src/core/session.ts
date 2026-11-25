@@ -60,4 +60,24 @@ export class InMemorySessionStore implements SessionStore {
   async attachWorkflow(sessionId: string, workflowId: string): Promise<void> { (await this.get(sessionId)).workflowIds.push(workflowId); }
   async close(id: string): Promise<void> { (await this.get(id)).status = "closed"; }
   async count(): Promise<number> { return this.sessions.size; }
+
+  /** Internal recovery hooks used by the persistent store adapter. */
+  restore(sessions: Session[]): void {
+    this.sessions.clear();
+    const cutoff = this.now() - this.ttlMs;
+    for (const session of sessions) {
+      if (Date.parse(session.updatedAt) >= cutoff) this.sessions.set(session.id, session);
+    }
+    // Recovery must not evict a valid session merely because the restored count equals capacity.
+    while (this.sessions.size > this.max) {
+      let oldest: string | undefined; let oldestAt = Infinity;
+      for (const [id, session] of this.sessions) {
+        const updatedAt = Date.parse(session.updatedAt);
+        if (updatedAt < oldestAt) { oldestAt = updatedAt; oldest = id; }
+      }
+      if (!oldest) break;
+      this.sessions.delete(oldest);
+    }
+  }
+  snapshot(): Session[] { return [...this.sessions.values()]; }
 }

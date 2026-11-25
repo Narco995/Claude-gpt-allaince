@@ -5,4 +5,4 @@ import { createMcpServer } from "./interfaces/mcp.js";
 
 // stdio transport for local MCP clients (Claude Desktop / Claude Code). Logs go to stderr only.
 const { service } = createBridge(loadConfig());
-await createMcpServer(service, "stdio").connect(new StdioServerTransport());
+await createMcpServer(service, { id: "human:local-mcp", scopes: ["*"] }).connect(new StdioServerTransport());

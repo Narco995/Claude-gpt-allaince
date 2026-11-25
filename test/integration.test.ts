@@ -47,7 +47,7 @@ describe("MANDATORY WORKFLOW: Claude directive → Bridge → GPT → result →
     // Structured protocol: ordered messages in the session
     const sess = (await request(e.app).get(`/api/sessions/${run.sessionId}`).expect(200)).body;
     expect(sess.messages.map((m: { type: string; from: string; to: string }) => `${m.from}>${m.to}:${m.type}`)).toEqual([
-      "claude>gpt:directive", "gpt>claude:result", "claude>gpt:critique", "gpt>claude:revision",
+      "human:local-development>gpt:directive", "gpt>claude:result", "claude>gpt:critique", "gpt>claude:revision",
     ]);
     expect(sess.workflowIds).toEqual([run.id]);
   });
@@ -82,6 +82,15 @@ describe("MANDATORY WORKFLOW: Claude directive → Bridge → GPT → result →
     await client.close();
   });
 
+  it("revises even when the first critique approves the draft", async () => {
+    const approved = JSON.stringify({ verdict: "approve", score: 9, summary: "Looks correct.", issues: [] });
+    const e = await env({ claude: () => anthropicText(approved) });
+    const run = (await request(e.app).post("/api/workflows").send({ directive: "d" }).expect(200)).body as WorkflowRun;
+    expect(run.rounds[0]?.critique?.verdict).toBe("approve");
+    expect(run.final).toContain("REVISED");
+    expect(e.gpt.requests).toHaveLength(2); // first critique always triggers a revision
+  });
+
   it("supports external critique: Claude (MCP caller) reviews GPT's draft, then GPT revises", async () => {
     const e = await env();
     const paused = (await request(e.app).post("/api/workflows").send({ directive: "Write a haiku about APIs", critiqueMode: "external" }).expect(200)).body as WorkflowRun;
@@ -94,6 +103,53 @@ describe("MANDATORY WORKFLOW: Claude directive → Bridge → GPT → result →
     expect(done.rounds[0]?.critiqueSource).toBe("external");
     expect(e.claude.requests).toHaveLength(0);
     await request(e.app).post(`/api/workflows/${paused.id}/critique`).send({ verdict: "approve", summary: "late" }).expect(409);
+  });
+
+  it("serializes concurrent manual critiques so the losing critique cannot overwrite", async () => {
+    const e = await env();
+    const paused = (await request(e.app).post("/api/workflows").send({ directive: "d", critiqueMode: "manual" }).expect(200)).body as WorkflowRun;
+    const critiqueA = { verdict: "revise", summary: "First authorized critique", issues: [{ severity: "high", description: "Add one missing item" }] };
+    const critiqueB = { verdict: "reject", summary: "Second concurrent critique", issues: [{ severity: "high", description: "Completely different" }] };
+    const [a, b] = await Promise.all([
+      request(e.app).post(`/api/workflows/${paused.id}/critique`).send(critiqueA),
+      request(e.app).post(`/api/workflows/${paused.id}/critique`).send(critiqueB),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    const final = (a.status === 200 ? a.body : b.body) as WorkflowRun;
+    expect(final.state).toBe("completed");
+    expect(final.rounds[0]?.critique?.summary).toBe(a.status === 200 ? critiqueA.summary : critiqueB.summary);
+  });
+
+  it("rejects auto self-critique when worker and critic resolve to the same adapter", async () => {
+    const e = await env();
+    await request(e.app).post("/api/workflows").send({ directive: "d", worker: "claude", critic: "anthropic" }).expect(400);
+    expect(e.gpt.requests).toHaveLength(0);
+    expect(e.claude.requests).toHaveLength(0);
+  });
+
+  it("supports idempotent workflow creation and rejects key reuse with a different payload", async () => {
+    const e = await env();
+    const body = { directive: "same directive", idempotencyKey: "req-unique-0000001", wait: false };
+    const [responseA, responseB] = await Promise.all([
+      request(e.app).post("/api/workflows").send(body),
+      request(e.app).post("/api/workflows").send(body),
+    ]);
+    expect(responseA.status).toBe(202); expect(responseB.status).toBe(202);
+    const first = responseA.body as WorkflowRun;
+    const replay = responseB.body as WorkflowRun;
+    expect(replay.id).toBe(first.id);
+    await request(e.app).post("/api/workflows").send({ ...body, directive: "different directive" }).expect(409);
+  });
+
+  it("limits concurrent workflows per identity", async () => {
+    const e = await env({ gpt: () => ({ hang: true }), env: { MAX_CONCURRENT_WORKFLOWS: "1", REQUEST_TIMEOUT_MS: "5000" } });
+    const responses = await Promise.all([
+      request(e.app).post("/api/workflows").send({ directive: "long task A", wait: false }),
+      request(e.app).post("/api/workflows").send({ directive: "long task B", wait: false }),
+    ]);
+    expect(responses.map((r) => r.status).sort()).toEqual([202, 429]);
+    const accepted = responses.find((r) => r.status === 202)!.body as WorkflowRun;
+    await request(e.app).post(`/api/workflows/${accepted.id}/cancel`).expect(200);
   });
 
   it("supports multiple revision rounds", async () => {
@@ -199,6 +255,27 @@ describe("REST surface, security, delegate", () => {
     await request(e.app).delete(`/api/sessions/${d.sessionId}`).expect(204);
     await request(e.app).post("/api/delegate").send({ directive: "x", sessionId: d.sessionId }).expect(409);
     await request(e.app).get("/api/nope").expect(404);
+  });
+
+  it("enforces identity scopes and prevents cross-owner session/workflow access", async () => {
+    const tokens = [
+      { id: "human:alice", token: "alice-long-token-0001", scopes: ["workflow:run", "workflow:read", "workflow:critique", "workflow:cancel", "session:read", "session:write", "tool:call", "model:list"] },
+      { id: "human:bob", token: "bob-long-token-0002", scopes: ["workflow:read", "workflow:run", "workflow:cancel", "session:read", "session:write", "tool:call", "model:list"] },
+      { id: "human:charlie", token: "charlie-long-token-0003", scopes: ["workflow:read"] },
+    ];
+    const e = await env({ env: { BRIDGE_API_KEY: "", BRIDGE_AUTH_TOKENS_JSON: JSON.stringify(tokens) } });
+    const alice = { Authorization: "Bearer alice-long-token-0001" };
+    const bob = { Authorization: "Bearer bob-long-token-0002" };
+    const charlie = { Authorization: "Bearer charlie-long-token-0003" };
+    const started = (await request(e.app).post("/api/workflows").set(alice).send({ directive: "owned by alice" }).expect(200)).body as WorkflowRun;
+    await request(e.app).get(`/api/sessions/${started.sessionId}`).set(bob).expect(404);
+    await request(e.app).get(`/api/workflows/${started.id}`).set(bob).expect(404);
+    await request(e.app).post(`/api/workflows/${started.id}/cancel`).set(bob).expect(404);
+    await request(e.app).post("/api/workflows").set(bob).send({ directive: "try to attach", sessionId: started.sessionId }).expect(404);
+    expect((await request(e.app).get("/api/sessions").set(bob).expect(200)).body.sessions).toHaveLength(0);
+    expect((await request(e.app).get("/api/workflows").set(bob).expect(200)).body.workflows).toHaveLength(0);
+    await request(e.app).post("/api/workflows").set(charlie).send({ directive: "no run scope", critiqueMode: "manual" }).expect(403);
+    expect((await request(e.app).get(`/api/workflows/${started.id}`).set(alice).expect(200)).body.id).toBe(started.id);
   });
 
   it("works with only one provider configured (clear error for the other)", async () => {

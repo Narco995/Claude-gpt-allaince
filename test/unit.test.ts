@@ -11,6 +11,11 @@ import { parseCritique } from "../src/core/workflow.js";
 import { AgentMessageSchema } from "../src/core/protocol.js";
 import { StaticTokenAuth } from "../src/auth.js";
 import { ScopeAuthorizer } from "../src/extensions/index.js";
+import { FileSessionStore, FileWorkflowRunStore } from "../src/core/persistence.js";
+import { WorkflowEngine, WorkflowInputSchema, type WorkflowRun } from "../src/core/workflow.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { AdapterRegistry } from "../src/core/models.js";
 
 const ctx = () => ({ signal: new AbortController().signal, logger: createLogger("error") });
@@ -129,11 +134,62 @@ describe("misc", () => {
     expect(await a.authenticate({ authorization: "Bearer nope" })).toBeNull();
     expect(await a.authenticate({})).toBeNull();
   });
-  it("ScopeAuthorizer", () => {
+  it("ScopeAuthorizer enforces risk tags separately from ordinary tool access", () => {
     const z = new ScopeAuthorizer();
-    expect(z.can({ id: "a", scopes: ["*"] }, "admin")).toBe(true);
+    expect(z.can({ id: "human", scopes: ["*"] }, "admin")).toBe(true);
     expect(z.can({ id: "a", scopes: ["workflow:*"] }, "workflow:run")).toBe(true);
     expect(z.can({ id: "a", scopes: ["workflow:*"] }, "tool:call")).toBe(false);
+    expect(z.can({ id: "agent:gpt", scopes: ["tool:call"] }, "tool:call", { type: "tool", id: "calculator", tags: ["safe"] })).toBe(true);
+    expect(z.can({ id: "agent:gpt", scopes: ["tool:call"] }, "tool:call", { type: "tool", id: "send_email", tags: ["external", "write"] })).toBe(false);
+    expect(z.can({ id: "human:approver", scopes: ["tool:call:write"] }, "tool:call", { type: "tool", id: "send_email", tags: ["external", "write"] })).toBe(true);
+  });
+
+  it("blocks unsafe tools from the restricted worker identity", async () => {
+    const authorizer = new ScopeAuthorizer();
+    const reg = new ToolRegistry().register(defineTool({ name: "send_email", description: "external write", tags: ["external", "write"], inputSchema: z.object({}), execute: async () => "sent" }));
+    await expect(reg.call("send_email", {}, { ...ctx(), principal: { id: "agent:gpt", scopes: ["tool:call"] }, authorizer })).rejects.toMatchObject({ code: "forbidden" });
+    await expect(reg.call("send_email", {}, { ...ctx(), principal: { id: "human:approver", scopes: ["tool:call:write"] }, authorizer })).resolves.toBe("sent");
+  });
+
+  it("accepts five critique/revision rounds, rejects six, and normalizes Auto/Manual aliases", () => {
+    expect(WorkflowInputSchema.parse({ directive: "x", revisionRounds: 5 }).revisionRounds).toBe(5);
+    expect(() => WorkflowInputSchema.parse({ directive: "x", revisionRounds: 6 })).toThrow();
+    expect(WorkflowInputSchema.parse({ directive: "x", critiqueMode: "adapter" }).critiqueMode).toBe("auto");
+    expect(WorkflowInputSchema.parse({ directive: "x", critiqueMode: "external" }).critiqueMode).toBe("manual");
+    expect(WorkflowInputSchema.parse({ directive: "x", critiqueMode: "manual" }).critiqueMode).toBe("manual");
+  });
+
+  it("persists sessions and recovers interrupted workflow snapshots", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "bridge-state-"));
+    try {
+      const sessionPath = join(dir, "sessions.json");
+      const workflowPath = join(dir, "workflows.json");
+      const store = new FileSessionStore(sessionPath);
+      const session = await store.create({ title: "durable", owner: "human:alice" });
+      await store.appendMessage(session.id, { from: "claude", to: "gpt", type: "directive", content: "preserve me" });
+      const reopened = new FileSessionStore(sessionPath);
+      expect((await reopened.get(session.id)).messages[0]?.content).toBe("preserve me");
+      const exactCapacityPath = join(dir, "exact-capacity.json");
+      const exactlyFull = new FileSessionStore(exactCapacityPath, 3_600_000, 2);
+      const first = await exactlyFull.create({ title: "first" });
+      await exactlyFull.create({ title: "second" });
+      const afterRestart = new FileSessionStore(exactCapacityPath, 3_600_000, 2);
+      expect(await afterRestart.count()).toBe(2);
+      expect((await afterRestart.get(first.id)).title).toBe("first");
+
+      const run = {
+        id: "11111111-1111-4111-8111-111111111111", sessionId: session.id, state: "delegating",
+        input: WorkflowInputSchema.parse({ directive: "recover me" }), rounds: [], history: [{ state: "created", at: new Date().toISOString() }],
+        usage: { inputTokens: 0, outputTokens: 0, modelCalls: 0, toolCalls: 0 }, models: {}, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      } as WorkflowRun;
+      const persistedRuns = new FileWorkflowRunStore(workflowPath);
+      await persistedRuns.save(run);
+      const recoveredEngine = new WorkflowEngine(new AdapterRegistry(), new ToolRegistry(), reopened, createLogger("error"), { maxToolRounds: 1, workflowTimeoutMs: 1000 }, new FileWorkflowRunStore(workflowPath), new ScopeAuthorizer());
+      const recovered = await recoveredEngine.get(run.id);
+      expect(recovered.state).toBe("failed");
+      expect(recovered.error?.code).toBe("interrupted");
+      expect(recovered.history.at(-1)?.note).toContain("restart");
+    } finally { await rm(dir, { recursive: true, force: true }); }
   });
   it("AdapterRegistry aliases + errors", () => {
     const r = new AdapterRegistry().register({ id: "openai", provider: "openai", defaultModel: "m", complete: async () => { throw new Error("x"); } }, ["gpt"]);

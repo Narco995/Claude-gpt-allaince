@@ -28,12 +28,18 @@ export interface ArtifactStore {
 // ---- Authentication + permissions -----------------------------------------------------------
 export interface Principal { id: string; scopes: string[]; metadata?: Record<string, unknown> }
 export interface AuthProvider { authenticate(headers: Record<string, string | string[] | undefined>): Promise<Principal | null> }
-export type Action = "workflow:run" | "workflow:read" | "workflow:cancel" | "session:read" | "session:write" | "tool:call" | "model:list" | "admin";
+export type Action = "workflow:run" | "workflow:read" | "workflow:critique" | "workflow:cancel" | "workflow:approve" | "session:read" | "session:write" | "tool:call" | "model:list" | "admin";
 export interface Authorizer { can(principal: Principal, action: Action, resource?: { type: string; id?: string; tags?: string[] }): boolean }
 /** Default policy: "*" scope or an exact "action" / "prefix:*" scope. Replace with RBAC/ABAC later. */
 export class ScopeAuthorizer implements Authorizer {
-  can(p: Principal, action: Action): boolean {
-    return p.scopes.some((s) => s === "*" || s === action || (s.endsWith(":*") && action.startsWith(s.slice(0, -1))));
+  can(p: Principal, action: Action, resource?: { type: string; id?: string; tags?: string[] }): boolean {
+    const scopes = p.scopes ?? [];
+    if (scopes.includes("*") || scopes.includes("admin")) return true;
+    if (action === "tool:call" && resource?.type === "tool") {
+      const risky = (resource.tags ?? []).some((tag) => /(write|external|destructive|sensitive|financial|send|delete|mutat|admin)/i.test(tag));
+      if (risky) return scopes.some((s) => s === "tool:call:write" || s === `tool:${resource.id}:call`);
+    }
+    return scopes.some((s) => s === action || (s.endsWith(":*") && action.startsWith(s.slice(0, -1))));
   }
 }
 

@@ -2,5 +2,10 @@ services:
   bridge:
     build: .
     ports: ["8787:8787"]
-    env_file: .env          # must set BRIDGE_API_KEY (NODE_ENV=production enforces it)
+    env_file: .env          # set BRIDGE_API_KEY or BRIDGE_AUTH_TOKENS_JSON
+    volumes:
+      - bridge-data:/app/data
     restart: unless-stopped
+
+volumes:
+  bridge-data:
