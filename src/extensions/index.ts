@@ -36,7 +36,10 @@ export class ScopeAuthorizer implements Authorizer {
     const scopes = p.scopes ?? [];
     if (scopes.includes("*") || scopes.includes("admin")) return true;
     if (action === "tool:call" && resource?.type === "tool") {
-      const risky = (resource.tags ?? []).some((tag) => /(write|external|destructive|sensitive|financial|send|delete|mutat|admin)/i.test(tag));
+      const tags = resource.tags ?? [];
+      // Agent identities fail closed: only explicitly safe/read-only tools may be invoked.
+      if (p.id.startsWith("agent:") && !tags.some((tag) => /^(safe|read[-_]only)$/i.test(tag))) return false;
+      const risky = tags.some((tag) => /(write|external|destructive|sensitive|financial|send|delete|mutat|admin)/i.test(tag));
       if (risky) return scopes.some((s) => s === "tool:call:write" || s === `tool:${resource.id}:call`);
     }
     return scopes.some((s) => s === action || (s.endsWith(":*") && action.startsWith(s.slice(0, -1))));

@@ -140,6 +140,8 @@ describe("misc", () => {
     expect(z.can({ id: "a", scopes: ["workflow:*"] }, "workflow:run")).toBe(true);
     expect(z.can({ id: "a", scopes: ["workflow:*"] }, "tool:call")).toBe(false);
     expect(z.can({ id: "agent:gpt", scopes: ["tool:call"] }, "tool:call", { type: "tool", id: "calculator", tags: ["safe"] })).toBe(true);
+    expect(z.can({ id: "agent:gpt", scopes: ["tool:call"] }, "tool:call", { type: "tool", id: "read_file", tags: ["read-only"] })).toBe(true);
+    expect(z.can({ id: "agent:gpt", scopes: ["tool:call"] }, "tool:call", { type: "tool", id: "unknown_plugin", tags: [] })).toBe(false);
     expect(z.can({ id: "agent:gpt", scopes: ["tool:call"] }, "tool:call", { type: "tool", id: "send_email", tags: ["external", "write"] })).toBe(false);
     expect(z.can({ id: "human:approver", scopes: ["tool:call:write"] }, "tool:call", { type: "tool", id: "send_email", tags: ["external", "write"] })).toBe(true);
   });
@@ -148,6 +150,8 @@ describe("misc", () => {
     const authorizer = new ScopeAuthorizer();
     const reg = new ToolRegistry().register(defineTool({ name: "send_email", description: "external write", tags: ["external", "write"], inputSchema: z.object({}), execute: async () => "sent" }));
     await expect(reg.call("send_email", {}, { ...ctx(), principal: { id: "agent:gpt", scopes: ["tool:call"] }, authorizer })).rejects.toMatchObject({ code: "forbidden" });
+    const untagged = new ToolRegistry().register(defineTool({ name: "future_plugin_tool", description: "not classified", inputSchema: z.object({}), execute: async () => "unsafe by default" }));
+    await expect(untagged.call("future_plugin_tool", {}, { ...ctx(), principal: { id: "agent:claude", scopes: ["tool:call"] }, authorizer })).rejects.toMatchObject({ code: "forbidden" });
     await expect(reg.call("send_email", {}, { ...ctx(), principal: { id: "human:approver", scopes: ["tool:call:write"] }, authorizer })).resolves.toBe("sent");
   });
 
